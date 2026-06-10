@@ -1,9 +1,8 @@
-
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import {
   Plane, PlaneTakeoff, Mail, Plus, RefreshCw, Trash2, TrendingDown, TrendingUp,
   ArrowRight, X, Loader2, Eye, CalendarDays, Settings, ExternalLink, Radio,
-  Gauge, MoveUp, Compass, Zap, Map as MapIcon
+  Gauge, MoveUp, Compass, Zap, Map as MapIcon, Wind, Thermometer, AlertTriangle
 } from "lucide-react";
 import { AreaChart, Area, YAxis, XAxis, Tooltip, ResponsiveContainer } from "recharts";
 
@@ -342,33 +341,179 @@ function loadLeaflet() {
   return _leaflet;
 }
 
-/* ════════════════════ LIVE MAP MODAL ════════════════════ */
-function MapModal({ flight: f, onClose, onTelemetry }) {
+/* ════════════════════ AIRPORT WEATHER & DELAYS ════════════════════ */
+const WMO = {
+  0: "Clear", 1: "Mostly clear", 2: "Partly cloudy", 3: "Overcast", 45: "Fog", 48: "Icy fog",
+  51: "Light drizzle", 53: "Drizzle", 55: "Heavy drizzle", 56: "Freezing drizzle", 57: "Freezing drizzle",
+  61: "Light rain", 63: "Rain", 65: "Heavy rain", 66: "Freezing rain", 67: "Freezing rain",
+  71: "Light snow", 73: "Snow", 75: "Heavy snow", 77: "Snow grains",
+  80: "Showers", 81: "Showers", 82: "Violent showers", 85: "Snow showers", 86: "Snow showers",
+  95: "Thunderstorm", 96: "Thunderstorm + hail", 99: "Thunderstorm + hail",
+};
+const _wxCache = {}, _dlyCache = {};
+async function airportWeather(iata) {
+  const c = _wxCache[iata];
+  if (c && Date.now() - c.at < 600000) return c;
+  const a = APMAP[iata];
+  if (!a) throw new Error("Unknown airport");
+  const u = `https://api.open-meteo.com/v1/forecast?latitude=${a[3]}&longitude=${a[4]}&current=temperature_2m,weather_code,wind_speed_10m,wind_direction_10m,wind_gusts_10m,relative_humidity_2m&temperature_unit=fahrenheit&wind_speed_unit=kn`;
+  const res = await fetch(u);
+  if (!res.ok) throw new Error(`wx ${res.status}`);
+  const j = await res.json();
+  const cur = j.current || {};
+  const out = {
+    at: Date.now(),
+    temp: cur.temperature_2m != null ? Math.round(cur.temperature_2m) : null,
+    cond: WMO[cur.weather_code] ?? "—",
+    code: cur.weather_code,
+    wind: cur.wind_speed_10m != null ? Math.round(cur.wind_speed_10m) : null,
+    gust: cur.wind_gusts_10m != null ? Math.round(cur.wind_gusts_10m) : null,
+    dir: cur.wind_direction_10m != null ? Math.round(cur.wind_direction_10m) : null,
+    hum: cur.relative_humidity_2m ?? null,
+  };
+  _wxCache[iata] = out;
+  return out;
+}
+const DELAY_LEVELS = {
+  none: { label: "No delays", color: "#7DF0B2" },
+  minor: { label: "Minor delays", color: "#5BE3F0" },
+  moderate: { label: "Moderate delays", color: "#FFC069" },
+  severe: { label: "Severe delays", color: "#FF8585" },
+};
+async function airportDelays(settings, iata) {
+  const c = _dlyCache[iata];
+  if (c && Date.now() - c.at < 600000) return c;
+  let out = null;
+  if (settings?.rapidKey) {
+    try {
+      const res = await fetch(`https://aerodatabox.p.rapidapi.com/airports/iata/${iata}/delays`, {
+        headers: { "X-RapidAPI-Key": settings.rapidKey, "X-RapidAPI-Host": "aerodatabox.p.rapidapi.com" },
+      });
+      if (res.ok) {
+        const j = await res.json();
+        const idx = j?.departuresDelayIndex ?? j?.delayIndex ?? j?.departures?.delayIndex;
+        const med = j?.departuresMedianDelay ?? null;
+        if (typeof idx === "number") {
+          const level = idx < 1 ? "none" : idx < 2.5 ? "minor" : idx < 3.5 ? "moderate" : "severe";
+          out = { at: Date.now(), level, note: med ? `Median departure delay ${med}` : `Delay index ${idx.toFixed(1)} / 5`, source: "aerodatabox" };
+        }
+      }
+    } catch { /* fall through */ }
+  }
+  if (!out) {
+    const r = await claudeJSON({
+      useWebSearch: true,
+      prompt: `Are there flight delays at ${APMAP[iata]?.[1] || iata} airport (${iata}) right now? Search.
+Respond ONLY JSON: {"level":"none|minor|moderate|severe","note":"one short sentence"}`,
+    });
+    out = { at: Date.now(), level: DELAY_LEVELS[r.level] ? r.level : "none", note: r.note || "", source: "ai" };
+  }
+  _dlyCache[iata] = out;
+  return out;
+}
+
+/* ════════════════════ AIRPORT SHEET ════════════════════ */
+function AirportSheet({ iata, settings, onClose }) {
+  const ap = APMAP[iata];
+  const [wx, setWx] = useState(null);
+  const [dly, setDly] = useState(null);
+  useEffect(() => {
+    setWx(null); setDly(null);
+    let dead = false;
+    airportWeather(iata).then((w) => !dead && setWx(w)).catch(() => !dead && setWx({ err: true }));
+    airportDelays(settings, iata).then((d) => !dead && setDly(d)).catch(() => !dead && setDly({ err: true }));
+    return () => { dead = true; };
+  }, [iata, settings]);
+  if (!ap) return null;
+  const lvl = dly && !dly.err ? DELAY_LEVELS[dly.level] : null;
+  return (
+    <div className="absolute left-3 right-3 rounded-2xl p-4 rise"
+      style={{ bottom: 84, background: "rgba(6,11,22,0.94)", border: `1px solid ${C.border}`, backdropFilter: "blur(14px)", zIndex: 600, boxShadow: "0 16px 50px rgba(0,0,0,0.6)" }}>
+      <div className="flex items-start justify-between">
+        <div>
+          <div style={{ ...disp, fontSize: 24, fontWeight: 700, color: C.text, lineHeight: 1 }}>{iata}</div>
+          <div style={{ ...mono, fontSize: 11, color: C.muted }} className="mt-1">{ap[1]} — {ap[2]}</div>
+        </div>
+        <button onClick={onClose} style={{ color: C.muted }} className="p-1"><X size={17} /></button>
+      </div>
+
+      {/* weather */}
+      <div className="flex items-center gap-4 mt-3 flex-wrap">
+        {wx === null ? (
+          <span style={{ ...mono, fontSize: 11, color: C.muted }} className="flex items-center gap-1.5"><Loader2 size={12} className="animate-spin" /> weather…</span>
+        ) : wx.err ? (
+          <span style={{ ...mono, fontSize: 11, color: C.muted }}>Weather unavailable</span>
+        ) : (
+          <>
+            <span className="flex items-center gap-1.5" style={{ ...mono, fontSize: 12, color: C.text }}>
+              <Thermometer size={13} style={{ color: C.cyan }} />{wx.temp != null ? `${wx.temp}°F` : "—"}
+              <span style={{ color: C.muted }}>· {wx.cond}</span>
+            </span>
+            {wx.wind != null && (
+              <span className="flex items-center gap-1.5" style={{ ...mono, fontSize: 12, color: C.text }}>
+                <Wind size={13} style={{ color: C.cyan }} />{wx.wind} kt{wx.dir != null ? ` @ ${wx.dir}°` : ""}
+                {wx.gust && wx.gust > (wx.wind || 0) + 8 ? <span style={{ color: C.amber }}> G{wx.gust}</span> : null}
+              </span>
+            )}
+          </>
+        )}
+      </div>
+
+      {/* delays */}
+      <div className="mt-3 pt-3 flex items-center justify-between" style={{ borderTop: `1px solid ${C.borderSoft}` }}>
+        {dly === null ? (
+          <span style={{ ...mono, fontSize: 11, color: C.muted }} className="flex items-center gap-1.5"><Loader2 size={12} className="animate-spin" /> checking delays…</span>
+        ) : dly.err ? (
+          <span style={{ ...mono, fontSize: 11, color: C.muted }}>Delay info unavailable</span>
+        ) : (
+          <div>
+            <span className="px-2 py-1 rounded-md uppercase font-medium"
+              style={{ ...mono, fontSize: 10.5, letterSpacing: "0.09em", color: lvl.color, background: `${lvl.color}1f`, boxShadow: dly.level === "severe" ? `0 0 14px ${lvl.color}44` : "none" }}>
+              {dly.level !== "none" && <AlertTriangle size={10} style={{ display: "inline", marginRight: 4, marginBottom: 2 }} />}
+              {lvl.label}
+            </span>
+            {dly.note && <span style={{ ...mono, fontSize: 10.5, color: C.muted }} className="block mt-1.5">{dly.note}</span>}
+          </div>
+        )}
+        {dly && !dly.err && <SourceTag source={dly.source === "aerodatabox" ? "aerodatabox" : "ai"} />}
+      </div>
+    </div>
+  );
+}
+
+/* ════════════════════ LIVE MAP (single flight or whole fleet) ════════════════════ */
+function MapModal({ flights, single, settings, onClose, onTelemetry }) {
   const divRef = useRef(null);
   const mapRef = useRef(null);
-  const planeRef = useRef(null);
-  const [tele, setTele] = useState(f.telemetry || null);
+  const planeRefs = useRef({});
+  const flownRefs = useRef({});
+  const [teleMap, setTeleMap] = useState(() => Object.fromEntries(flights.filter((f) => f.telemetry?.lat != null).map((f) => [f.id, f.telemetry])));
   const [err, setErr] = useState(null);
   const [checking, setChecking] = useState(false);
+  const [lastPing, setLastPing] = useState(null);
+  const [selAirport, setSelAirport] = useState(null);
 
-  const o = APMAP[f.origin], d = APMAP[f.dest];
+  const f0 = flights[0];
 
-  const planeIcon = (L, track) =>
+  const planeIcon = (L, track, label) =>
     L.divIcon({
       className: "",
-      html: `<div style="width:34px;height:34px;display:flex;align-items:center;justify-content:center;transform:rotate(${(track ?? 0)}deg);filter:drop-shadow(0 0 8px ${C.cyan});">
-        <svg width="26" height="26" viewBox="0 0 24 24" fill="${C.cyan}"><path d="M21 16v-2l-8-5V3.5a1.5 1.5 0 0 0-3 0V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5z"/></svg>
+      html: `<div style="display:flex;flex-direction:column;align-items:center;">
+        <div style="width:30px;height:30px;display:flex;align-items:center;justify-content:center;transform:rotate(${track ?? 0}deg);filter:drop-shadow(0 0 8px ${C.cyan});">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="${C.cyan}"><path d="M21 16v-2l-8-5V3.5a1.5 1.5 0 0 0-3 0V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5z"/></svg>
+        </div>
+        ${!single && label ? `<div style="font-family:'IBM Plex Mono',monospace;font-size:9px;letter-spacing:.08em;color:${C.cyan};text-shadow:0 1px 4px #000;margin-top:1px;">${label}</div>` : ""}
       </div>`,
-      iconSize: [34, 34], iconAnchor: [17, 17],
+      iconSize: [44, 40], iconAnchor: [22, 15],
     });
   const dotIcon = (L, color, label) =>
     L.divIcon({
       className: "",
-      html: `<div style="display:flex;flex-direction:column;align-items:center;gap:3px;transform:translateY(-4px);">
-        <div style="width:10px;height:10px;border-radius:50%;background:${color};box-shadow:0 0 10px ${color};border:2px solid rgba(255,255,255,0.25);"></div>
+      html: `<div style="display:flex;flex-direction:column;align-items:center;gap:3px;transform:translateY(-4px);cursor:pointer;">
+        <div style="width:11px;height:11px;border-radius:50%;background:${color};box-shadow:0 0 10px ${color};border:2px solid rgba(255,255,255,0.25);"></div>
         <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.08em;color:${color};text-shadow:0 1px 4px #000;">${label}</div>
       </div>`,
-      iconSize: [40, 28], iconAnchor: [20, 8],
+      iconSize: [44, 30], iconAnchor: [22, 9],
     });
 
   useEffect(() => {
@@ -378,75 +523,99 @@ function MapModal({ flight: f, onClose, onTelemetry }) {
       const map = L.map(divRef.current, { zoomControl: false, attributionControl: true, worldCopyJump: true });
       mapRef.current = map;
       L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
-        attribution: '&copy; OpenStreetMap &copy; CARTO', subdomains: "abcd", maxZoom: 12,
+        attribution: "&copy; OpenStreetMap &copy; CARTO", subdomains: "abcd", maxZoom: 12,
       }).addTo(map);
       L.control.zoom({ position: "bottomright" }).addTo(map);
 
       const bounds = [];
-      if (o && d) {
-        const route = gcPoints([o[3], o[4]], [d[3], d[4]]);
-        L.polyline(route, { color: "rgba(125,170,255,0.35)", weight: 1.5, dashArray: "3 6" }).addTo(map);
-        // flown portion
-        if (tele?.lat != null) {
-          const flown = gcPoints([o[3], o[4]], [tele.lat, tele.lon], 48);
-          L.polyline(flown, { color: C.cyan, weight: 2.5, opacity: 0.9 }).addTo(map);
+      const airportSet = new Map();
+      for (const f of flights) {
+        const o = APMAP[f.origin], d = APMAP[f.dest];
+        if (o && d) {
+          const route = gcPoints([o[3], o[4]], [d[3], d[4]]);
+          L.polyline(route, { color: "rgba(125,170,255,0.32)", weight: 1.5, dashArray: "3 6" }).addTo(map);
+          bounds.push([o[3], o[4]], [d[3], d[4]]);
         }
-        L.marker([o[3], o[4]], { icon: dotIcon(L, C.cyan, f.origin) }).addTo(map);
-        L.marker([d[3], d[4]], { icon: dotIcon(L, C.amber, f.dest) }).addTo(map);
-        bounds.push([o[3], o[4]], [d[3], d[4]]);
+        if (o) airportSet.set(f.origin, { ap: o, color: C.cyan });
+        if (d) airportSet.set(f.dest, { ap: d, color: C.amber });
+        const t = teleMap[f.id];
+        if (t?.lat != null) {
+          if (o) {
+            flownRefs.current[f.id] = L.polyline(gcPoints([o[3], o[4]], [t.lat, t.lon], 48), { color: C.cyan, weight: 2.5, opacity: 0.9 }).addTo(map);
+          }
+          planeRefs.current[f.id] = L.marker([t.lat, t.lon], { icon: planeIcon(L, t.track, f.flightNo), zIndexOffset: 1000 }).addTo(map);
+          bounds.push([t.lat, t.lon]);
+        }
       }
-      if (tele?.lat != null) {
-        planeRef.current = L.marker([tele.lat, tele.lon], { icon: planeIcon(L, tele.track), zIndexOffset: 1000 }).addTo(map);
-        bounds.push([tele.lat, tele.lon]);
+      for (const [code, { ap, color }] of airportSet) {
+        const m = L.marker([ap[3], ap[4]], { icon: dotIcon(L, color, code) }).addTo(map);
+        m.on("click", () => setSelAirport(code));
       }
-      if (bounds.length) map.fitBounds(bounds, { padding: [46, 46] });
+      if (bounds.length) map.fitBounds(bounds, { padding: [50, 50] });
       else map.setView([30, 0], 2);
     }).catch((e) => setErr(e.message));
-
-    return () => { dead = true; if (mapRef.current) { mapRef.current.remove(); mapRef.current = null; } };
+    return () => { dead = true; if (mapRef.current) { mapRef.current.remove(); mapRef.current = null; } planeRefs.current = {}; flownRefs.current = {}; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const refreshPosition = useCallback(async () => {
+  const refreshPositions = useCallback(async () => {
     setChecking(true);
-    const t = await adsbLive(f);
-    setChecking(false);
-    if (!t) return false;
-    setTele(t);
-    onTelemetry?.(t);
-    const L = window.L;
-    if (L && mapRef.current) {
-      if (planeRef.current) {
-        planeRef.current.setLatLng([t.lat, t.lon]);
-        planeRef.current.setIcon(planeIcon(L, t.track));
-      } else {
-        planeRef.current = L.marker([t.lat, t.lon], { icon: planeIcon(L, t.track), zIndexOffset: 1000 }).addTo(mapRef.current);
-        mapRef.current.panTo([t.lat, t.lon]);
+    const active = flights.filter((f) => !["Landed", "Cancelled"].includes(f.status));
+    for (const f of active) {
+      let t = null;
+      try { t = await adsbLive(f); } catch { /* skip */ }
+      if (!t) continue;
+      setTeleMap((m) => ({ ...m, [f.id]: t }));
+      onTelemetry?.(f.id, t);
+      const L = window.L;
+      if (L && mapRef.current) {
+        const ex = planeRefs.current[f.id];
+        if (ex) { ex.setLatLng([t.lat, t.lon]); ex.setIcon(planeIcon(L, t.track, f.flightNo)); }
+        else {
+          planeRefs.current[f.id] = L.marker([t.lat, t.lon], { icon: planeIcon(L, t.track, f.flightNo), zIndexOffset: 1000 }).addTo(mapRef.current);
+          if (single) mapRef.current.panTo([t.lat, t.lon]);
+        }
+        const o = APMAP[f.origin];
+        if (o) {
+          const flownPts = gcPoints([o[3], o[4]], [t.lat, t.lon], 48);
+          if (flownRefs.current[f.id]) flownRefs.current[f.id].setLatLngs(flownPts);
+          else flownRefs.current[f.id] = L.polyline(flownPts, { color: C.cyan, weight: 2.5, opacity: 0.9 }).addTo(mapRef.current);
+        }
       }
     }
-    return true;
-  }, [f, onTelemetry]);
+    setLastPing(Date.now());
+    setChecking(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [flights, onTelemetry, single]);
 
   useEffect(() => {
-    refreshPosition();
-    const iv = setInterval(refreshPosition, 25000);
+    refreshPositions();
+    const iv = setInterval(refreshPositions, 25000);
     return () => clearInterval(iv);
-  }, [refreshPosition]);
+  }, [refreshPositions]);
+
+  const liveCount = Object.keys(teleMap).length;
+  const tele = single ? teleMap[f0?.id] : null;
 
   return (
     <div className="fixed inset-0 z-50 flex flex-col" style={{ background: "#04070F" }}>
-      {/* top bar */}
-      <div className="flex items-center justify-between px-4 py-3" style={{ borderBottom: `1px solid ${C.borderSoft}`, background: "rgba(4,7,15,0.9)", backdropFilter: "blur(10px)", zIndex: 500 }}>
+      <div className="flex items-center justify-between px-4 py-3" style={{ borderBottom: `1px solid ${C.borderSoft}`, background: "rgba(4,7,15,0.9)", backdropFilter: "blur(10px)", zIndex: 700 }}>
         <div>
-          <div style={{ ...mono, fontSize: 9, color: C.muted, letterSpacing: "0.25em" }} className="uppercase">Live radar</div>
+          <div style={{ ...mono, fontSize: 9, color: C.muted, letterSpacing: "0.25em" }} className="uppercase">{single ? "Live radar" : "Fleet radar"}</div>
           <div style={{ ...disp, fontSize: 17, fontWeight: 700, color: C.text }}>
-            {f.flightNo} <span style={{ color: C.muted, fontWeight: 500 }}>{f.origin}</span>
-            <ArrowRight size={13} style={{ display: "inline", margin: "0 5px 2px", color: C.cyan }} />
-            <span style={{ color: C.muted, fontWeight: 500 }}>{f.dest}</span>
+            {single ? (
+              <>
+                {f0.flightNo} <span style={{ color: C.muted, fontWeight: 500 }}>{f0.origin}</span>
+                <ArrowRight size={13} style={{ display: "inline", margin: "0 5px 2px", color: C.cyan }} />
+                <span style={{ color: C.muted, fontWeight: 500 }}>{f0.dest}</span>
+              </>
+            ) : (
+              <>{flights.length} flight{flights.length !== 1 ? "s" : ""} <span style={{ color: C.cyan, fontWeight: 500 }}>· {liveCount} live</span></>
+            )}
           </div>
         </div>
         <div className="flex items-center gap-2">
-          <button onClick={refreshPosition} className="px-3 py-2 rounded-xl flex items-center gap-1.5 active:scale-95 transition-transform"
+          <button onClick={refreshPositions} className="px-3 py-2 rounded-xl flex items-center gap-1.5 active:scale-95 transition-transform"
             style={{ ...mono, fontSize: 11, color: C.cyan, background: C.cyanDim, border: "1px solid rgba(91,227,240,0.25)" }}>
             {checking ? <Loader2 size={12} className="animate-spin" /> : <Radio size={12} />} Ping
           </button>
@@ -456,30 +625,38 @@ function MapModal({ flight: f, onClose, onTelemetry }) {
         </div>
       </div>
 
-      {/* map */}
       <div className="flex-1 relative">
         <div ref={divRef} style={{ position: "absolute", inset: 0, background: "#0A0F1A" }} />
         {err && (
           <div className="absolute inset-0 flex items-center justify-center p-6" style={{ background: "#04070F" }}>
             <p style={{ ...mono, fontSize: 12, color: C.muted, textAlign: "center" }}>
-              Map library blocked in this environment — host the app to enable tiles.<br />Live position still updates on the flight card.
+              Map library blocked in this environment — host the app to enable tiles.<br />Live positions still update on the flight cards.
             </p>
           </div>
         )}
-        {/* telemetry HUD */}
+
+        {/* HUD */}
         <div className="absolute left-3 bottom-3 rounded-2xl px-4 py-3" style={{ background: "rgba(5,10,20,0.85)", border: `1px solid ${C.border}`, backdropFilter: "blur(10px)", zIndex: 500 }}>
-          {tele ? (
-            <div className="flex gap-5">
-              <div><div className="hud-l">ALT</div><div className="hud-v">{tele.alt != null ? tele.alt.toLocaleString() : "—"}<span className="hud-u"> FT</span></div></div>
-              <div><div className="hud-l">GS</div><div className="hud-v">{tele.gs ?? "—"}<span className="hud-u"> KT</span></div></div>
-              <div><div className="hud-l">TRK</div><div className="hud-v">{tele.track ?? "—"}<span className="hud-u">°</span></div></div>
-            </div>
+          {single ? (
+            tele ? (
+              <div className="flex gap-5">
+                <div><div className="hud-l">ALT</div><div className="hud-v">{tele.alt != null ? tele.alt.toLocaleString() : "—"}<span className="hud-u"> FT</span></div></div>
+                <div><div className="hud-l">GS</div><div className="hud-v">{tele.gs ?? "—"}<span className="hud-u"> KT</span></div></div>
+                <div><div className="hud-l">TRK</div><div className="hud-v">{tele.track ?? "—"}<span className="hud-u">°</span></div></div>
+              </div>
+            ) : (
+              <div style={{ ...mono, fontSize: 11, color: C.muted }}>{checking ? "Pinging ADS-B network…" : "No live signal — aircraft may not be airborne yet."}</div>
+            )
           ) : (
             <div style={{ ...mono, fontSize: 11, color: C.muted }}>
-              {checking ? "Pinging ADS-B network…" : "No live signal — aircraft may not be airborne yet."}
+              <span style={{ color: C.cyan }}>{liveCount}</span> aircraft live
+              {lastPing && <span> · pinged {new Date(lastPing).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>}
             </div>
           )}
+          <div style={{ ...mono, fontSize: 9.5, color: C.muted, opacity: 0.6 }} className="mt-1.5">tap an airport for weather + delays</div>
         </div>
+
+        {selAirport && <AirportSheet iata={selAirport} settings={settings} onClose={() => setSelAirport(null)} />}
       </div>
       <style>{`
         .hud-l { font-family:'IBM Plex Mono',monospace; font-size:9px; letter-spacing:.18em; color:${C.muted}; }
@@ -1158,6 +1335,12 @@ IATA codes, 24h times, ISO dates. If none: [].`,
                 {scanning ? <Loader2 size={13} className="animate-spin" /> : <Mail size={13} />}
                 {scanning ? "Scanning…" : "Gmail"}
               </button>
+              <button onClick={() => flights.length && setModal({ type: "map", flights, single: false })} disabled={!flights.length}
+                className="px-3 py-2 rounded-xl active:scale-95 transition-transform"
+                style={{ color: flights.length ? C.green : C.muted, background: flights.length ? "rgba(125,240,178,0.08)" : "rgba(125,170,255,0.06)", border: `1px solid ${flights.length ? "rgba(125,240,178,0.22)" : C.borderSoft}`, opacity: flights.length ? 1 : 0.5 }}
+                aria-label="Fleet radar map">
+                <MapIcon size={15} />
+              </button>
               <button onClick={() => setModal({ type: "settings" })} className="px-3 py-2 rounded-xl active:scale-95 transition-transform"
                 style={{ color: C.muted, background: "rgba(125,170,255,0.06)", border: `1px solid ${C.borderSoft}` }} aria-label="Data settings">
                 <Settings size={15} />
@@ -1220,7 +1403,7 @@ IATA codes, 24h times, ISO dates. If none: [].`,
               <div className="rise" key={f.id}>
                 <FlightCard flight={f} busy={!!busyIds[f.id]}
                   onRefresh={() => refreshFlight(f)}
-                  onMap={() => setModal({ type: "map", flight: f })}
+                  onMap={() => setModal({ type: "map", flights: [f], single: true })}
                   onWatch={() => setModal({ type: "watch", prefill: { origin: f.origin, dest: f.dest } })}
                   onDelete={() => update((p) => ({ ...p, flights: p.flights.filter((x) => x.id !== f.id) }))} />
               </div>
@@ -1265,344 +1448,13 @@ IATA codes, 24h times, ISO dates. If none: [].`,
           </Modal>
         )}
         {modal?.type === "map" && (
-          <MapModal flight={modal.flight} onClose={() => setModal(null)}
-            onTelemetry={(t) => update((p) => ({
+          <MapModal flights={modal.flights} single={modal.single} settings={data.settings} onClose={() => setModal(null)}
+            onTelemetry={(fid, t) => update((p) => ({
               ...p,
-              flights: p.flights.map((x) => x.id === modal.flight.id ? { ...x, telemetry: t, status: "In Air", source: x.source || "adsb" } : x),
+              flights: p.flights.map((x) => x.id === fid ? { ...x, telemetry: t, status: "In Air", source: x.source || "adsb" } : x),
             }))} />
         )}
       </div>
-    </div>
-  );
-}
-
-
-/* ════════════════════ AIRPORT WEATHER & DELAYS ════════════════════ */
-const WMO = {
-  0: "Clear", 1: "Mostly clear", 2: "Partly cloudy", 3: "Overcast", 45: "Fog", 48: "Icy fog",
-  51: "Light drizzle", 53: "Drizzle", 55: "Heavy drizzle", 56: "Freezing drizzle", 57: "Freezing drizzle",
-  61: "Light rain", 63: "Rain", 65: "Heavy rain", 66: "Freezing rain", 67: "Freezing rain",
-  71: "Light snow", 73: "Snow", 75: "Heavy snow", 77: "Snow grains",
-  80: "Showers", 81: "Showers", 82: "Violent showers", 85: "Snow showers", 86: "Snow showers",
-  95: "Thunderstorm", 96: "Thunderstorm + hail", 99: "Thunderstorm + hail",
-};
-const _wxCache = {}, _dlyCache = {};
-async function airportWeather(iata) {
-  const c = _wxCache[iata];
-  if (c && Date.now() - c.at < 600000) return c;
-  const a = APMAP[iata];
-  if (!a) throw new Error("Unknown airport");
-  const u = `https://api.open-meteo.com/v1/forecast?latitude=${a[3]}&longitude=${a[4]}&current=temperature_2m,weather_code,wind_speed_10m,wind_direction_10m,wind_gusts_10m,relative_humidity_2m&temperature_unit=fahrenheit&wind_speed_unit=kn`;
-  const res = await fetch(u);
-  if (!res.ok) throw new Error(`wx ${res.status}`);
-  const j = await res.json();
-  const cur = j.current || {};
-  const out = {
-    at: Date.now(),
-    temp: cur.temperature_2m != null ? Math.round(cur.temperature_2m) : null,
-    cond: WMO[cur.weather_code] ?? "—",
-    code: cur.weather_code,
-    wind: cur.wind_speed_10m != null ? Math.round(cur.wind_speed_10m) : null,
-    gust: cur.wind_gusts_10m != null ? Math.round(cur.wind_gusts_10m) : null,
-    dir: cur.wind_direction_10m != null ? Math.round(cur.wind_direction_10m) : null,
-    hum: cur.relative_humidity_2m ?? null,
-  };
-  _wxCache[iata] = out;
-  return out;
-}
-const DELAY_LEVELS = {
-  none: { label: "No delays", color: "#7DF0B2" },
-  minor: { label: "Minor delays", color: "#5BE3F0" },
-  moderate: { label: "Moderate delays", color: "#FFC069" },
-  severe: { label: "Severe delays", color: "#FF8585" },
-};
-async function airportDelays(settings, iata) {
-  const c = _dlyCache[iata];
-  if (c && Date.now() - c.at < 600000) return c;
-  let out = null;
-  if (settings?.rapidKey) {
-    try {
-      const res = await fetch(`https://aerodatabox.p.rapidapi.com/airports/iata/${iata}/delays`, {
-        headers: { "X-RapidAPI-Key": settings.rapidKey, "X-RapidAPI-Host": "aerodatabox.p.rapidapi.com" },
-      });
-      if (res.ok) {
-        const j = await res.json();
-        const idx = j?.departuresDelayIndex ?? j?.delayIndex ?? j?.departures?.delayIndex;
-        const med = j?.departuresMedianDelay ?? null;
-        if (typeof idx === "number") {
-          const level = idx < 1 ? "none" : idx < 2.5 ? "minor" : idx < 3.5 ? "moderate" : "severe";
-          out = { at: Date.now(), level, note: med ? `Median departure delay ${med}` : `Delay index ${idx.toFixed(1)} / 5`, source: "aerodatabox" };
-        }
-      }
-    } catch { /* fall through */ }
-  }
-  if (!out) {
-    const r = await claudeJSON({
-      useWebSearch: true,
-      prompt: `Are there flight delays at ${APMAP[iata]?.[1] || iata} airport (${iata}) right now? Search.
-Respond ONLY JSON: {"level":"none|minor|moderate|severe","note":"one short sentence"}`,
-    });
-    out = { at: Date.now(), level: DELAY_LEVELS[r.level] ? r.level : "none", note: r.note || "", source: "ai" };
-  }
-  _dlyCache[iata] = out;
-  return out;
-}
-
-/* ════════════════════ AIRPORT SHEET ════════════════════ */
-function AirportSheet({ iata, settings, onClose }) {
-  const ap = APMAP[iata];
-  const [wx, setWx] = useState(null);
-  const [dly, setDly] = useState(null);
-  useEffect(() => {
-    setWx(null); setDly(null);
-    let dead = false;
-    airportWeather(iata).then((w) => !dead && setWx(w)).catch(() => !dead && setWx({ err: true }));
-    airportDelays(settings, iata).then((d) => !dead && setDly(d)).catch(() => !dead && setDly({ err: true }));
-    return () => { dead = true; };
-  }, [iata, settings]);
-  if (!ap) return null;
-  const lvl = dly && !dly.err ? DELAY_LEVELS[dly.level] : null;
-  return (
-    <div className="absolute left-3 right-3 rounded-2xl p-4 rise"
-      style={{ bottom: 84, background: "rgba(6,11,22,0.94)", border: `1px solid ${C.border}`, backdropFilter: "blur(14px)", zIndex: 600, boxShadow: "0 16px 50px rgba(0,0,0,0.6)" }}>
-      <div className="flex items-start justify-between">
-        <div>
-          <div style={{ ...disp, fontSize: 24, fontWeight: 700, color: C.text, lineHeight: 1 }}>{iata}</div>
-          <div style={{ ...mono, fontSize: 11, color: C.muted }} className="mt-1">{ap[1]} — {ap[2]}</div>
-        </div>
-        <button onClick={onClose} style={{ color: C.muted }} className="p-1"><X size={17} /></button>
-      </div>
-
-      {/* weather */}
-      <div className="flex items-center gap-4 mt-3 flex-wrap">
-        {wx === null ? (
-          <span style={{ ...mono, fontSize: 11, color: C.muted }} className="flex items-center gap-1.5"><Loader2 size={12} className="animate-spin" /> weather…</span>
-        ) : wx.err ? (
-          <span style={{ ...mono, fontSize: 11, color: C.muted }}>Weather unavailable</span>
-        ) : (
-          <>
-            <span className="flex items-center gap-1.5" style={{ ...mono, fontSize: 12, color: C.text }}>
-              <Thermometer size={13} style={{ color: C.cyan }} />{wx.temp != null ? `${wx.temp}°F` : "—"}
-              <span style={{ color: C.muted }}>· {wx.cond}</span>
-            </span>
-            {wx.wind != null && (
-              <span className="flex items-center gap-1.5" style={{ ...mono, fontSize: 12, color: C.text }}>
-                <Wind size={13} style={{ color: C.cyan }} />{wx.wind} kt{wx.dir != null ? ` @ ${wx.dir}°` : ""}
-                {wx.gust && wx.gust > (wx.wind || 0) + 8 ? <span style={{ color: C.amber }}> G{wx.gust}</span> : null}
-              </span>
-            )}
-          </>
-        )}
-      </div>
-
-      {/* delays */}
-      <div className="mt-3 pt-3 flex items-center justify-between" style={{ borderTop: `1px solid ${C.borderSoft}` }}>
-        {dly === null ? (
-          <span style={{ ...mono, fontSize: 11, color: C.muted }} className="flex items-center gap-1.5"><Loader2 size={12} className="animate-spin" /> checking delays…</span>
-        ) : dly.err ? (
-          <span style={{ ...mono, fontSize: 11, color: C.muted }}>Delay info unavailable</span>
-        ) : (
-          <div>
-            <span className="px-2 py-1 rounded-md uppercase font-medium"
-              style={{ ...mono, fontSize: 10.5, letterSpacing: "0.09em", color: lvl.color, background: `${lvl.color}1f`, boxShadow: dly.level === "severe" ? `0 0 14px ${lvl.color}44` : "none" }}>
-              {dly.level !== "none" && <AlertTriangle size={10} style={{ display: "inline", marginRight: 4, marginBottom: 2 }} />}
-              {lvl.label}
-            </span>
-            {dly.note && <span style={{ ...mono, fontSize: 10.5, color: C.muted }} className="block mt-1.5">{dly.note}</span>}
-          </div>
-        )}
-        {dly && !dly.err && <SourceTag source={dly.source === "aerodatabox" ? "aerodatabox" : "ai"} />}
-      </div>
-    </div>
-  );
-}
-
-/* ════════════════════ LIVE MAP (single flight or whole fleet) ════════════════════ */
-function MapModal({ flights, single, settings, onClose, onTelemetry }) {
-  const divRef = useRef(null);
-  const mapRef = useRef(null);
-  const planeRefs = useRef({});
-  const flownRefs = useRef({});
-  const [teleMap, setTeleMap] = useState(() => Object.fromEntries(flights.filter((f) => f.telemetry?.lat != null).map((f) => [f.id, f.telemetry])));
-  const [err, setErr] = useState(null);
-  const [checking, setChecking] = useState(false);
-  const [lastPing, setLastPing] = useState(null);
-  const [selAirport, setSelAirport] = useState(null);
-
-  const f0 = flights[0];
-
-  const planeIcon = (L, track, label) =>
-    L.divIcon({
-      className: "",
-      html: `<div style="display:flex;flex-direction:column;align-items:center;">
-        <div style="width:30px;height:30px;display:flex;align-items:center;justify-content:center;transform:rotate(${track ?? 0}deg);filter:drop-shadow(0 0 8px ${C.cyan});">
-          <svg width="24" height="24" viewBox="0 0 24 24" fill="${C.cyan}"><path d="M21 16v-2l-8-5V3.5a1.5 1.5 0 0 0-3 0V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5z"/></svg>
-        </div>
-        ${!single && label ? `<div style="font-family:'IBM Plex Mono',monospace;font-size:9px;letter-spacing:.08em;color:${C.cyan};text-shadow:0 1px 4px #000;margin-top:1px;">${label}</div>` : ""}
-      </div>`,
-      iconSize: [44, 40], iconAnchor: [22, 15],
-    });
-  const dotIcon = (L, color, label) =>
-    L.divIcon({
-      className: "",
-      html: `<div style="display:flex;flex-direction:column;align-items:center;gap:3px;transform:translateY(-4px);cursor:pointer;">
-        <div style="width:11px;height:11px;border-radius:50%;background:${color};box-shadow:0 0 10px ${color};border:2px solid rgba(255,255,255,0.25);"></div>
-        <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.08em;color:${color};text-shadow:0 1px 4px #000;">${label}</div>
-      </div>`,
-      iconSize: [44, 30], iconAnchor: [22, 9],
-    });
-
-  useEffect(() => {
-    let dead = false;
-    loadLeaflet().then((L) => {
-      if (dead || !divRef.current) return;
-      const map = L.map(divRef.current, { zoomControl: false, attributionControl: true, worldCopyJump: true });
-      mapRef.current = map;
-      L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
-        attribution: "&copy; OpenStreetMap &copy; CARTO", subdomains: "abcd", maxZoom: 12,
-      }).addTo(map);
-      L.control.zoom({ position: "bottomright" }).addTo(map);
-
-      const bounds = [];
-      const airportSet = new Map();
-      for (const f of flights) {
-        const o = APMAP[f.origin], d = APMAP[f.dest];
-        if (o && d) {
-          const route = gcPoints([o[3], o[4]], [d[3], d[4]]);
-          L.polyline(route, { color: "rgba(125,170,255,0.32)", weight: 1.5, dashArray: "3 6" }).addTo(map);
-          bounds.push([o[3], o[4]], [d[3], d[4]]);
-        }
-        if (o) airportSet.set(f.origin, { ap: o, color: C.cyan });
-        if (d) airportSet.set(f.dest, { ap: d, color: C.amber });
-        const t = teleMap[f.id];
-        if (t?.lat != null) {
-          if (o) {
-            flownRefs.current[f.id] = L.polyline(gcPoints([o[3], o[4]], [t.lat, t.lon], 48), { color: C.cyan, weight: 2.5, opacity: 0.9 }).addTo(map);
-          }
-          planeRefs.current[f.id] = L.marker([t.lat, t.lon], { icon: planeIcon(L, t.track, f.flightNo), zIndexOffset: 1000 }).addTo(map);
-          bounds.push([t.lat, t.lon]);
-        }
-      }
-      for (const [code, { ap, color }] of airportSet) {
-        const m = L.marker([ap[3], ap[4]], { icon: dotIcon(L, color, code) }).addTo(map);
-        m.on("click", () => setSelAirport(code));
-      }
-      if (bounds.length) map.fitBounds(bounds, { padding: [50, 50] });
-      else map.setView([30, 0], 2);
-    }).catch((e) => setErr(e.message));
-    return () => { dead = true; if (mapRef.current) { mapRef.current.remove(); mapRef.current = null; } planeRefs.current = {}; flownRefs.current = {}; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  const refreshPositions = useCallback(async () => {
-    setChecking(true);
-    const active = flights.filter((f) => !["Landed", "Cancelled"].includes(f.status));
-    for (const f of active) {
-      let t = null;
-      try { t = await adsbLive(f); } catch { /* skip */ }
-      if (!t) continue;
-      setTeleMap((m) => ({ ...m, [f.id]: t }));
-      onTelemetry?.(f.id, t);
-      const L = window.L;
-      if (L && mapRef.current) {
-        const ex = planeRefs.current[f.id];
-        if (ex) { ex.setLatLng([t.lat, t.lon]); ex.setIcon(planeIcon(L, t.track, f.flightNo)); }
-        else {
-          planeRefs.current[f.id] = L.marker([t.lat, t.lon], { icon: planeIcon(L, t.track, f.flightNo), zIndexOffset: 1000 }).addTo(mapRef.current);
-          if (single) mapRef.current.panTo([t.lat, t.lon]);
-        }
-        const o = APMAP[f.origin];
-        if (o) {
-          const flownPts = gcPoints([o[3], o[4]], [t.lat, t.lon], 48);
-          if (flownRefs.current[f.id]) flownRefs.current[f.id].setLatLngs(flownPts);
-          else flownRefs.current[f.id] = L.polyline(flownPts, { color: C.cyan, weight: 2.5, opacity: 0.9 }).addTo(mapRef.current);
-        }
-      }
-    }
-    setLastPing(Date.now());
-    setChecking(false);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [flights, onTelemetry, single]);
-
-  useEffect(() => {
-    refreshPositions();
-    const iv = setInterval(refreshPositions, 25000);
-    return () => clearInterval(iv);
-  }, [refreshPositions]);
-
-  const liveCount = Object.keys(teleMap).length;
-  const tele = single ? teleMap[f0?.id] : null;
-
-  return (
-    <div className="fixed inset-0 z-50 flex flex-col" style={{ background: "#04070F" }}>
-      <div className="flex items-center justify-between px-4 py-3" style={{ borderBottom: `1px solid ${C.borderSoft}`, background: "rgba(4,7,15,0.9)", backdropFilter: "blur(10px)", zIndex: 700 }}>
-        <div>
-          <div style={{ ...mono, fontSize: 9, color: C.muted, letterSpacing: "0.25em" }} className="uppercase">{single ? "Live radar" : "Fleet radar"}</div>
-          <div style={{ ...disp, fontSize: 17, fontWeight: 700, color: C.text }}>
-            {single ? (
-              <>
-                {f0.flightNo} <span style={{ color: C.muted, fontWeight: 500 }}>{f0.origin}</span>
-                <ArrowRight size={13} style={{ display: "inline", margin: "0 5px 2px", color: C.cyan }} />
-                <span style={{ color: C.muted, fontWeight: 500 }}>{f0.dest}</span>
-              </>
-            ) : (
-              <>{flights.length} flight{flights.length !== 1 ? "s" : ""} <span style={{ color: C.cyan, fontWeight: 500 }}>· {liveCount} live</span></>
-            )}
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
-          <button onClick={refreshPositions} className="px-3 py-2 rounded-xl flex items-center gap-1.5 active:scale-95 transition-transform"
-            style={{ ...mono, fontSize: 11, color: C.cyan, background: C.cyanDim, border: "1px solid rgba(91,227,240,0.25)" }}>
-            {checking ? <Loader2 size={12} className="animate-spin" /> : <Radio size={12} />} Ping
-          </button>
-          <button onClick={onClose} className="p-2 rounded-xl" style={{ color: C.muted, background: "rgba(125,170,255,0.07)", border: `1px solid ${C.borderSoft}` }}>
-            <X size={18} />
-          </button>
-        </div>
-      </div>
-
-      <div className="flex-1 relative">
-        <div ref={divRef} style={{ position: "absolute", inset: 0, background: "#0A0F1A" }} />
-        {err && (
-          <div className="absolute inset-0 flex items-center justify-center p-6" style={{ background: "#04070F" }}>
-            <p style={{ ...mono, fontSize: 12, color: C.muted, textAlign: "center" }}>
-              Map library blocked in this environment — host the app to enable tiles.<br />Live positions still update on the flight cards.
-            </p>
-          </div>
-        )}
-
-        {/* HUD */}
-        <div className="absolute left-3 bottom-3 rounded-2xl px-4 py-3" style={{ background: "rgba(5,10,20,0.85)", border: `1px solid ${C.border}`, backdropFilter: "blur(10px)", zIndex: 500 }}>
-          {single ? (
-            tele ? (
-              <div className="flex gap-5">
-                <div><div className="hud-l">ALT</div><div className="hud-v">{tele.alt != null ? tele.alt.toLocaleString() : "—"}<span className="hud-u"> FT</span></div></div>
-                <div><div className="hud-l">GS</div><div className="hud-v">{tele.gs ?? "—"}<span className="hud-u"> KT</span></div></div>
-                <div><div className="hud-l">TRK</div><div className="hud-v">{tele.track ?? "—"}<span className="hud-u">°</span></div></div>
-              </div>
-            ) : (
-              <div style={{ ...mono, fontSize: 11, color: C.muted }}>{checking ? "Pinging ADS-B network…" : "No live signal — aircraft may not be airborne yet."}</div>
-            )
-          ) : (
-            <div style={{ ...mono, fontSize: 11, color: C.muted }}>
-              <span style={{ color: C.cyan }}>{liveCount}</span> aircraft live
-              {lastPing && <span> · pinged {new Date(lastPing).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>}
-            </div>
-          )}
-          <div style={{ ...mono, fontSize: 9.5, color: C.muted, opacity: 0.6 }} className="mt-1.5">tap an airport for weather + delays</div>
-        </div>
-
-        {selAirport && <AirportSheet iata={selAirport} settings={settings} onClose={() => setSelAirport(null)} />}
-      </div>
-      <style>{`
-        .hud-l { font-family:'IBM Plex Mono',monospace; font-size:9px; letter-spacing:.18em; color:${C.muted}; }
-        .hud-v { font-family:'Space Grotesk',sans-serif; font-size:19px; font-weight:700; color:${C.cyan}; }
-        .hud-u { font-size:10px; color:${C.muted}; font-family:'IBM Plex Mono',monospace; }
-        .leaflet-container { font-family:'IBM Plex Mono',monospace; }
-        .leaflet-control-attribution { background: rgba(4,7,15,0.7) !important; color:${C.muted} !important; font-size:9px !important; }
-        .leaflet-control-attribution a { color:${C.muted} !important; }
-        .leaflet-bar a { background:#0B1322 !important; color:${C.cyan} !important; border-color:${C.borderSoft} !important; }
-      `}</style>
     </div>
   );
 }
